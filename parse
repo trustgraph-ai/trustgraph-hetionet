@@ -270,9 +270,7 @@ class Processor:
 
         print("DONE")
 
-# input = "hetnet/json/hetionet-v1.0.json.bz2"
-
-base = "../hetionet"
+base = "."
 input = f"{base}/hetnet/json/hetionet-v1.0.json.bz2"
 
 p = Processor(input)
