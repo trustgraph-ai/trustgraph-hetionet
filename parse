@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+
+import asyncio
+import aiohttp
+import json_stream
+import json_stream.dump
+import bz2
+import json
+from fastembed import TextEmbedding
+
+from trustgraph.knowledge import Uri, Literal
+from trustgraph.knowledge import IS_A, LABEL, NAME, DESCRIPTION, URL
+from trustgraph.knowledge import hash
+
+model="sentence-transformers/all-MiniLM-L6-v2"
+
+def prop_uri(type):
+    return Uri(f"https://trustgraph.ai/e/hetionet/prop/{type}")
+
+def node_type_uri(type):
+    return Uri(f"https://trustgraph.ai/e/hetionet/node-type/{type}")
+
+def edge_uri(type):
+    return Uri(f"https://trustgraph.ai/e/hetionet/edge/{type}")
+
+def node_uri(type, id):
+    id = hash(f"{type}/{id}")
+    return Uri(f"https://trustgraph.ai/e/hetionet/node/{id}")
+
+class Processor:
+
+    def __init__(self, path):
+        self.path = path
+
+        self.user = "trustgraph"
+        self.collection = "default"
+
+        self.doc_id = "https://trustgraph/e/hetionet"
+        self.embeddings = TextEmbedding(model_name = model)
+
+    async def process_ec(self, ent, context):
+
+        vecs = self.embeddings.embed([context])
+        vecs = [v.tolist() for v in vecs]
+
+        t = {
+            "metadata": {
+                "id": self.doc_id,
+                "metadata": [],
+                "user": self.user,
+                "collection": self.collection
+            },
+            "entities": [
+                {
+                    "entity": {
+                        "v": ent, "e": isinstance(ent, Uri)
+                    },
+                    "vectors": vecs
+                }
+            ]
+        }
+
+        await self.ge_q.put(t)
+
+    async def process_triple(self, t):
+
+        t = {
+            "metadata": {
+                "id": self.doc_id,
+                "metadata": [],
+                "user": self.user,
+                "collection": self.collection
+            },
+            "triples": [
+                {
+                    "s": {
+                        "v": t[0], "e": isinstance(t[0], Uri)
+                    },
+                    "p": {
+                        "v": t[1], "e": isinstance(t[1], Uri)
+                    },
+                    "o": {
+                        "v": t[2], "e": isinstance(t[2], Uri)
+                    }
+                }
+            ]
+        }
+
+        await self.tr_q.put(t)
+
+    async def process_node_type(self, type):
+
+        await self.process_triple((
+            node_type_uri(type), Uri(LABEL), Literal(type)
+        ))
+
+        await self.process_ec(node_type_uri(type), type)
+
+    async def process_edge_type(self, edge_type):
+
+        source_type, target_type, type, direction = edge_type
+
+        await self.process_triple((
+            edge_uri(type), Uri(LABEL), Literal(type)
+        ))
+
+        await self.process_ec(edge_uri(type), type)
+
+    async def process_node(self, node):
+
+        type = node["kind"]
+        identifier = node["identifier"]
+        name = node["name"]
+        data = node["data"]
+
+        await self.process_triple((
+            node_uri(type, identifier), Uri(IS_A), node_type_uri(type)
+        ))
+        await self.process_triple((
+            node_uri(type, identifier), Uri(LABEL), Literal(name)
+        ))
+
+        # data fields:
+        # bto_id
+        # chromosome
+        # class_type
+        # description
+        # inchi
+        # inchikey
+        # license
+        # mesh_id
+        # source
+        # url
+
+        for k, v in data.items():
+
+            if k == "description":
+                await self.process_triple((
+                    node_uri(type, identifier), Uri(DESCRIPTION), Literal(v)
+                ))
+                await self.process_ec(node_uri(type, identifier), v)
+
+            if k == "chromosome":
+                await self.process_triple((
+                    node_uri(type, identifier), prop_uri("chromosome"),
+                    Literal(v)
+                ))
+
+            if k == "source":
+                await self.process_triple((
+                    node_uri(type, identifier), prop_uri("source"), Literal(v)
+                ))
+                await self.process_ec(node_uri(type, identifier), v)
+
+            if k == "sources":
+                for w in v:
+                    await self.process_triple((
+                        node_uri(type, identifier), prop_uri("source"),
+                        Literal(w)
+                    ))
+                    await self.process_ec(node_uri(type, identifier), v)
+
+    async def process_edge(self, edge):
+
+        source_type, source_id = edge["source_id"]
+        target_type, target_id = edge["target_id"]
+        type = edge["kind"]
+        direction = edge["direction"]
+        data = edge["data"]
+
+        await self.process_triple((
+            node_uri(source_type, source_id),
+            edge_uri(type),
+            node_uri(target_type, target_id)
+        ))
+
+        #  actions
+        #  affinity_nM
+        #  license
+        #  log2_fold_change
+        #  method
+        #  pubmed_ids
+        #  similarity
+        #  source
+        #  sources
+        #  subtypes
+        #  unbiased
+        #  url
+        #  urls
+        #  z_score
+
+    async def process(self):
+
+        await self.process_triple((
+            Uri(self.doc_id), Uri(LABEL), Literal("Hetionet")
+        ))
+
+        await self.process_triple((
+            Uri(DESCRIPTION), Uri(LABEL), Literal("description")
+        ))
+        await self.process_triple((
+            prop_uri("chromosome"), Uri(LABEL), Literal("chromosome")
+        ))
+        await self.process_triple((
+            prop_uri("source"), Uri(LABEL), Literal("source")
+        ))
+
+        with bz2.open(self.path, "r") as f:
+
+            stream = json_stream.load(f)
+
+            mnk = stream["metanode_kinds"]
+            for v in mnk:
+                await self.process_node_type(v)
+
+            mnt = stream["metaedge_tuples"]
+            for v in mnt:
+                await self.process_edge_type(v)
+
+            nodes = stream["nodes"]
+            for v in nodes:
+                await self.process_node(v)
+
+            edges = stream["edges"]
+            for v in edges:
+                await self.process_edge(v)
+
+        await self.ge_q.put(None)
+        await self.tr_q.put(None)
+
+    async def queue_runner(self, q, url):
+
+        print("Queue runner for", url, "starting...")
+
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(url) as ws:
+
+                while True:
+
+                    item = await q.get()
+
+                    if item is None: break
+
+                    await ws.send_json(item)
+
+                print("Done for", url)
+
+    async def run(self):
+
+        url = "http://localhost:8088/api/v1/"
+
+        self.running = True
+
+        self.ge_q = asyncio.Queue(maxsize=1000)
+        self.tr_q = asyncio.Queue(maxsize=1000)
+
+        self.ge_task = asyncio.create_task(
+            self.queue_runner(self.ge_q, f"{url}load/graph-embeddings")
+        )
+
+        self.tr_task = asyncio.create_task(
+            self.queue_runner(self.tr_q, f"{url}load/triples")
+        )
+
+        self.process_task = asyncio.create_task(
+            self.process()
+        )
+
+        await asyncio.gather(self.ge_task, self.tr_task, self.process_task)
+
+        print("DONE")
+
+# input = "hetnet/json/hetionet-v1.0.json.bz2"
+
+base = "../hetionet"
+input = f"{base}/hetnet/json/hetionet-v1.0.json.bz2"
+
+p = Processor(input)
+asyncio.run(p.run())
+
