@@ -7,14 +7,69 @@ import json_stream
 import json_stream.dump
 import bz2
 import json
-from fastembed import TextEmbedding
 import argparse
 
 from trustgraph.knowledge import Uri, Literal
 from trustgraph.knowledge import IS_A, LABEL, NAME, DESCRIPTION, URL
 from trustgraph.knowledge import hash
 
+class Embeddings:
 
+    def __init__(self, url):
+
+        self.q = asyncio.Queue(maxsize=10)
+        self.r = asyncio.Queue(maxsize=10)
+        self.running = True
+
+        if url[-1] != "/":
+            url += "/"
+
+        self.url = f"{url}api/v1/socket"
+
+    async def queue_runner(self, q, url):
+
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(url) as ws:
+
+                while self.running:
+
+                    try:
+                        item = await asyncio.wait_for(
+                            q.get(), 1
+                        )
+                    except TimeoutError:
+                        continue
+
+                    await ws.send_json({
+                        "id": "FIXME",
+                        "service": "embeddings",
+                        "request": {
+                            "text": item
+                        }
+                    })
+
+                    item = await ws.receive_json()
+
+                    try:
+                        await self.r.put(item["response"]["vectors"])
+                    except:
+                        raise RuntimeError("Embeddings fail")
+
+    async def embed(self, text):
+
+        await self.q.put(text)
+
+        return await self.r.get()
+
+    async def start(self):
+
+        self.task = asyncio.create_task(
+            self.queue_runner(self.q, self.url)
+        )
+
+    async def stop(self):
+        self.running = False
+        await self.task
 
 def prop_uri(type):
     return Uri(f"https://trustgraph.ai/e/hetionet/prop/{type}")
@@ -33,7 +88,7 @@ class Processor:
 
     def __init__(
             self, input_file, url, user, collection, verbose,
-            embeddings_model, doc_id
+            doc_id
     ):
 
         self.verbose = verbose
@@ -47,7 +102,6 @@ class Processor:
         self.collection = collection
 
         self.doc_id = doc_id
-        self.embeddings = TextEmbedding(model_name = embeddings_model)
 
         self.url = url
 
@@ -59,8 +113,7 @@ class Processor:
 
     async def process_ec(self, ent, context):
 
-        vecs = self.embeddings.embed([context])
-        vecs = [v.tolist() for v in vecs]
+        vecs = await self.embeddings.embed(context)
 
         t = {
             "metadata": {
@@ -281,6 +334,9 @@ class Processor:
 
     async def run(self):
 
+        self.embeddings = Embeddings(url="http://localhost:8088")
+        await self.embeddings.start()
+
         url = self.url + "api/v1/"
 
         self.running = True
@@ -302,6 +358,8 @@ class Processor:
 
         await asyncio.gather(self.ge_task, self.tr_task, self.process_task)
 
+        await self.embeddings.stop()
+
         print("All complete.")
 
 def run():
@@ -314,7 +372,6 @@ def run():
     default_url = os.getenv("TRUSTGRAPH_API", "http://localhost:8088")
     default_user = "trustgraph"
     default_collection = "default"
-    default_model = "sentence-transformers/all-MiniLM-L6-v2"
     default_doc_id = "https://trustgraph/e/hetionet"
 
     parser.add_argument(
@@ -325,7 +382,6 @@ def run():
 
     parser.add_argument(
         '-i', '--input-file',
-        # Make it mandatory, difficult to over-write an existing file
         required=True,
         help=f'Output file'
     )
@@ -340,12 +396,6 @@ def run():
         '--collection',
         default=default_collection,
         help=f'Collection ID to load as (default: {default_collection})'
-    )
-
-    parser.add_argument(
-        '--embeddings-model',
-        default=default_model,
-        help=f'User ID to load as (default: {default_model})'
     )
 
     parser.add_argument(
