@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import os
 import asyncio
 import aiohttp
 import json_stream
@@ -7,12 +8,13 @@ import json_stream.dump
 import bz2
 import json
 from fastembed import TextEmbedding
+import argparse
 
 from trustgraph.knowledge import Uri, Literal
 from trustgraph.knowledge import IS_A, LABEL, NAME, DESCRIPTION, URL
 from trustgraph.knowledge import hash
 
-model="sentence-transformers/all-MiniLM-L6-v2"
+
 
 def prop_uri(type):
     return Uri(f"https://trustgraph.ai/e/hetionet/prop/{type}")
@@ -29,14 +31,31 @@ def node_uri(type, id):
 
 class Processor:
 
-    def __init__(self, path):
-        self.path = path
+    def __init__(
+            self, input_file, url, user, collection, verbose,
+            embeddings_model, doc_id
+    ):
 
-        self.user = "trustgraph"
-        self.collection = "default"
+        self.verbose = verbose
 
-        self.doc_id = "https://trustgraph/e/hetionet"
-        self.embeddings = TextEmbedding(model_name = model)
+        if self.verbose:
+            print("Initialise...")
+
+        self.path = input_file
+
+        self.user = user
+        self.collection = collection
+
+        self.doc_id = doc_id
+        self.embeddings = TextEmbedding(model_name = embeddings_model)
+
+        self.url = url
+
+        if self.url[-1] != '/':
+            self.url += '/'
+
+        if self.verbose:
+            print("Initialised.")
 
     async def process_ec(self, ent, context):
 
@@ -90,6 +109,9 @@ class Processor:
 
     async def process_node_type(self, type):
 
+        if self.verbose:
+            print("Node type:", type)
+
         await self.process_triple((
             node_type_uri(type), Uri(LABEL), Literal(type)
         ))
@@ -99,6 +121,9 @@ class Processor:
     async def process_edge_type(self, edge_type):
 
         source_type, target_type, type, direction = edge_type
+
+        if self.verbose:
+            print("Edge type:", type)
 
         await self.process_triple((
             edge_uri(type), Uri(LABEL), Literal(type)
@@ -113,6 +138,9 @@ class Processor:
         name = node["name"]
         data = node["data"]
 
+        if self.verbose:
+            print("Node:", type, identifier)
+
         await self.process_triple((
             node_uri(type, identifier), Uri(IS_A), node_type_uri(type)
         ))
@@ -120,17 +148,17 @@ class Processor:
             node_uri(type, identifier), Uri(LABEL), Literal(name)
         ))
 
-        # data fields:
-        # bto_id
-        # chromosome
-        # class_type
-        # description
-        # inchi
-        # inchikey
-        # license
-        # mesh_id
-        # source
-        # url
+        # Available data fields:
+        #   bto_id
+        #   chromosome
+        #   class_type
+        #   description
+        #   inchi
+        #   inchikey
+        #   license
+        #   mesh_id
+        #   source
+        #   url
 
         for k, v in data.items():
 
@@ -168,26 +196,30 @@ class Processor:
         direction = edge["direction"]
         data = edge["data"]
 
+        if self.verbose:
+            print("Edge:", source_type, source_id, target_type, target_id)
+
         await self.process_triple((
             node_uri(source_type, source_id),
             edge_uri(type),
             node_uri(target_type, target_id)
         ))
 
-        #  actions
-        #  affinity_nM
-        #  license
-        #  log2_fold_change
-        #  method
-        #  pubmed_ids
-        #  similarity
-        #  source
-        #  sources
-        #  subtypes
-        #  unbiased
-        #  url
-        #  urls
-        #  z_score
+        # Available data fields:
+        #   actions
+        #   affinity_nM
+        #   license
+        #   log2_fold_change
+        #   method
+        #   pubmed_ids
+        #   similarity
+        #   source
+        #   sources
+        #   subtypes
+        #   unbiased
+        #   url
+        #   urls
+        #   z_score
 
     async def process(self):
 
@@ -230,7 +262,8 @@ class Processor:
 
     async def queue_runner(self, q, url):
 
-        print("Queue runner for", url, "starting...")
+        if self.verbose:
+            print("Queue runner for", url, "starting...")
 
         async with aiohttp.ClientSession() as session:
             async with session.ws_connect(url) as ws:
@@ -243,11 +276,12 @@ class Processor:
 
                     await ws.send_json(item)
 
-                print("Done for", url)
+                if self.verbose:
+                    print("Processing complete for", url)
 
     async def run(self):
 
-        url = "http://localhost:8088/api/v1/"
+        url = self.url + "api/v1/"
 
         self.running = True
 
@@ -268,11 +302,69 @@ class Processor:
 
         await asyncio.gather(self.ge_task, self.tr_task, self.process_task)
 
-        print("DONE")
+        print("All complete.")
 
-base = "."
-input = f"{base}/hetnet/json/hetionet-v1.0.json.bz2"
+def run():
+    
+    parser = argparse.ArgumentParser(
+        prog='tg-load-kg-core',
+        description=__doc__,
+    )
 
-p = Processor(input)
-asyncio.run(p.run())
+    default_url = os.getenv("TRUSTGRAPH_API", "http://localhost:8088")
+    default_user = "trustgraph"
+    default_collection = "default"
+    default_model = "sentence-transformers/all-MiniLM-L6-v2"
+    default_doc_id = "https://trustgraph/e/hetionet"
+
+    parser.add_argument(
+        '-u', '--url',
+        default=default_url,
+        help=f'TrustGraph API URL (default: {default_url})',
+    )
+
+    parser.add_argument(
+        '-i', '--input-file',
+        # Make it mandatory, difficult to over-write an existing file
+        required=True,
+        help=f'Output file'
+    )
+
+    parser.add_argument(
+        '--user',
+        default=default_user,
+        help=f'User ID to load as (default: {default_user})'
+    )
+
+    parser.add_argument(
+        '--collection',
+        default=default_collection,
+        help=f'Collection ID to load as (default: {default_collection})'
+    )
+
+    parser.add_argument(
+        '--embeddings-model',
+        default=default_model,
+        help=f'User ID to load as (default: {default_model})'
+    )
+
+    parser.add_argument(
+        '--doc-id',
+        default=default_doc_id,
+        help=f'User ID to load as (default: {default_doc_id})'
+    )
+
+    parser.add_argument(
+        '-v', '--verbose',
+        action="store_true",
+        help=f'Verbose output'
+    )
+
+    args = parser.parse_args()
+    args = vars(args)
+
+    p = Processor(**args)
+    asyncio.run(p.run())
+
+run()
 
